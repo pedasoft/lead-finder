@@ -1,38 +1,43 @@
 import streamlit as st
-import json
+import pandas as pd
 import requests
+import json
+import io
 from openai import OpenAI
 
 # --- SAYFA AYARLARI ---
-st.set_page_config(page_title="AI Sales Agent", page_icon="🤖", layout="wide")
+st.set_page_config(page_title="AI Sales Hunter", page_icon="🎯", layout="wide")
 
-st.title("🤖 Otonom B2B Satış Ajanı")
-st.markdown("Bu ajan, belirlediğiniz hedef kitleyi Google'da arar, analiz eder ve taslak mail yazar.")
+st.title("🎯 B2B Sales Lead Generator")
+st.markdown("Hedef kitlenizi arayın, profilleri ayrıştırın, e-postaları zenginleştirin ve Excel'e aktarın.")
 
-# --- SIDEBAR: API ANAHTARLARI ---
+# --- SIDEBAR: AYARLAR ---
 with st.sidebar:
-    st.header("🔑 API Ayarları")
-    openai_api_key = st.text_input("OpenAI API Key", type="password", help="GPT-4 için gerekli")
-    serper_api_key = st.text_input("Serper.dev API Key", type="password", help="Google Araması için gerekli")
+    st.header("⚙️ Konfigürasyon")
+    
+    st.subheader("1. API Anahtarları")
+    openai_api_key = st.text_input("OpenAI API Key", type="password")
+    serper_api_key = st.text_input("Serper (Google) API Key", type="password")
+    hunter_api_key = st.text_input("Hunter.io API Key (Opsiyonel)", type="password", help="Gerçek e-posta bulmak için gereklidir. Girilmezse tahmini mail üretilir.")
     
     st.divider()
-    st.markdown("### 🎯 Hedef Kitle")
-    target_position = st.text_input("Hedef Ünvan", "Logistics Manager")
-    target_industry = st.text_input("Sektör", "Shipping")
-    target_location = st.text_input("Lokasyon", "Dubai")
     
-    st.divider()
-    st.markdown("### 📦 Ürün Bilgisi")
-    product_name = st.text_input("Ürün Adı", "RouteOpt")
-    value_proposition = st.text_area("Değer Önerisi (Value Prop)", "Yapay zeka ile rota optimizasyonu yaparak yakıt maliyetlerini %20 düşürüyoruz.")
+    st.subheader("2. Hedef Kitle")
+    target_position = st.text_input("Ünvan", "General Manager")
+    target_industry = st.text_input("Sektör", "Construction")
+    target_location = st.text_input("Lokasyon", "Istanbul")
+    
+    search_limit = st.slider("Sonuç Sayısı", 5, 20, 10)
 
-# --- TOOL FONKSİYONLARI ---
+# --- YARDIMCI FONKSİYONLAR ---
 
-def google_search(position, industry, location, api_key):
+def google_search(position, industry, location, api_key, num_results):
     """Google Serper API ile arama yapar."""
     url = "https://google.serper.dev/search"
+    # LinkedIn X-Ray Arama Sorgusu
     query = f'site:linkedin.com/in/ "{position}" "{industry}" "{location}"'
-    payload = json.dumps({"q": query, "num": 5})
+    
+    payload = json.dumps({"q": query, "num": num_results})
     headers = {'X-API-KEY': api_key, 'Content-Type': 'application/json'}
 
     try:
@@ -41,80 +46,165 @@ def google_search(position, industry, location, api_key):
     except Exception as e:
         return {"error": str(e)}
 
-def send_email_mock(to_name, content):
-    """Mail gönderim simülasyonu."""
-    return {"status": "success", "message": f"Email {to_name} kişisine iletildi."}
+def parse_profile(item):
+    """
+    LinkedIn başlığını (Title) analiz edip Ad, Ünvan ve Şirket bilgisini ayıklar.
+    Örnek Title: "Ahmet Yılmaz - Genel Müdür - ABC İnşaat | LinkedIn"
+    """
+    title = item.get("title", "")
+    parts = title.split("-")
+    
+    # Varsayılan değerler
+    name = "Bilinmiyor"
+    role = "Bilinmiyor"
+    company = "Bilinmiyor"
+    
+    if len(parts) >= 1:
+        name = parts[0].strip()
+    if len(parts) >= 2:
+        role = parts[1].strip()
+    if len(parts) >= 3:
+        # Şirket adındaki gereksiz " | LinkedIn" kısmını temizle
+        company = parts[2].split("|")[0].strip()
+        
+    return name, role, company
 
-# --- AJAN MANTIĞI ---
+def find_email_hunter(name, company, api_key):
+    """
+    Hunter.io API kullanarak mail bulur. 
+    Eğer API Key yoksa veya domain bulunamazsa 'pattern' tabanlı tahmin yapar.
+    """
+    if not api_key:
+        # API Key yoksa simülasyon yap (Tahmini format)
+        domain = company.lower().replace(" ", "") + ".com"
+        email = f"{name.lower().replace(' ', '.')}@{domain}"
+        return email, "Tahmini (API Yok)"
+    
+    # 1. Önce Şirketin Domainini Bulmaya Çalış (Hunter Domain Search)
+    domain_url = f"https://api.hunter.io/v2/domain-search?company={company}&api_key={api_key}"
+    try:
+        domain_res = requests.get(domain_url).json()
+        if "data" in domain_res and domain_res["data"].get("domain"):
+            domain = domain_res["data"]["domain"]
+            
+            # 2. Kişinin Mailini Bul (Email Finder)
+            # İsim soyisim ayrıştırma
+            name_parts = name.split(" ")
+            first_name = name_parts[0]
+            last_name = name_parts[-1] if len(name_parts) > 1 else ""
+            
+            finder_url = f"https://api.hunter.io/v2/email-finder?domain={domain}&first_name={first_name}&last_name={last_name}&api_key={api_key}"
+            email_res = requests.get(finder_url).json()
+            
+            if "data" in email_res and email_res["data"].get("email"):
+                return email_res["data"]["email"], "Doğrulanmış (Hunter)"
+            else:
+                return f"Bulunamadı (@{domain})", "Domain bulundu, Kişi bulunamadı"
+        else:
+            return "Domain Bulunamadı", "Başarısız"
+            
+    except Exception:
+        return "Hata", "API Hatası"
 
-def run_agent():
-    if not openai_api_key or not serper_api_key:
-        st.error("Lütfen önce sol menüden API anahtarlarını girin.")
+# --- ANA UYGULAMA MANTIĞI ---
+
+def run_app():
+    if not serper_api_key:
+        st.warning("⚠️ Lütfen sol menüden Serper API anahtarını girin.")
         return
 
-    client = OpenAI(api_key=openai_api_key)
-    
-    # UI'da Log Alanı Oluştur
-    log_container = st.container()
-    
-    with log_container:
-        st.info("🚀 Ajan başlatılıyor...")
+    # Başlatma Butonu
+    if st.button("🚀 Taramayı Başlat", type="primary"):
         
-        # 1. ADIM: ARAŞTIRMA
-        st.write(f"🔎 **Araştırılıyor:** {target_position} in {target_location} ({target_industry})")
-        search_results = google_search(target_position, target_industry, target_location, serper_api_key)
+        status_text = st.empty()
+        progress_bar = st.progress(0)
         
-        leads = []
-        if "organic" in search_results:
-            for item in search_results["organic"]:
-                leads.append({
-                    "name": item.get("title", "").split("-")[0].strip(),
-                    "link": item.get("link"),
-                    "snippet": item.get("snippet")
-                })
-        else:
+        # 1. ADIM: ARAMA
+        status_text.text("🔍 Google üzerinde LinkedIn profilleri taranıyor...")
+        results = google_search(target_position, target_industry, target_location, serper_api_key, search_limit)
+        progress_bar.progress(30)
+        
+        if "organic" not in results:
             st.error("Sonuç bulunamadı veya API hatası.")
             return
 
-        st.success(f"✅ {len(leads)} adet potansiyel müşteri bulundu.")
-        st.json(leads) # Ham veriyi göster
-
-        # 2. ADIM: ANALİZ VE MAİL YAZIMI (GPT-4)
-        st.write("✍️ **GPT-4 Müşterileri Analiz Ediyor ve Mail Yazıyor...**")
+        items = results["organic"]
+        processed_data = []
         
-        for lead in leads:
-            with st.expander(f"📧 Taslak: {lead['name']}"):
-                prompt = f"""
-                Sen bir B2B Satış Uzmanısın.
+        # 2. ADIM: PARSING VE ENRICHMENT
+        status_text.text(f"🧩 {len(items)} profil ayrıştırılıyor ve e-postalar zenginleştiriliyor...")
+        
+        total_items = len(items)
+        for i, item in enumerate(items):
+            # Parsing
+            name, role, company = parse_profile(item)
+            linkedin_url = item.get("link")
+            snippet = item.get("snippet")
+            
+            # Enrichment (Email Bulma)
+            email, status = find_email_hunter(name, company, hunter_api_key)
+            
+            processed_data.append({
+                "Ad Soyad": name,
+                "Ünvan": role,
+                "Şirket": company,
+                "E-Posta": email,
+                "Durum": status,
+                "LinkedIn URL": linkedin_url,
+                "Bağlam (Snippet)": snippet
+            })
+            
+            # Progress bar güncelle
+            current_progress = 30 + int((i / total_items) * 60)
+            progress_bar.progress(current_progress)
+            
+        progress_bar.progress(100)
+        status_text.text("✅ İşlem tamamlandı!")
+        
+        # 3. ADIM: DATAFRAME OLUŞTURMA
+        df = pd.DataFrame(processed_data)
+        
+        # Ekrana Grid Olarak Basma (Data Editor ile düzenlenebilir yaparız)
+        st.subheader("📋 Sonuç Listesi")
+        edited_df = st.data_editor(
+            df,
+            column_config={
+                "LinkedIn URL": st.column_config.LinkColumn("Profil Linki"),
+                "E-Posta": st.column_config.TextColumn("E-Posta Adresi", help="Otomatik bulunan veya tahmin edilen adres")
+            },
+            hide_index=True,
+            use_container_width=True
+        )
+        
+        # 4. ADIM: EXCEL İNDİRME
+        st.subheader("💾 Dışa Aktar")
+        
+        # Excel'i hafızada (RAM) oluşturuyoruz, diske yazmıyoruz (Cloud uyumlu)
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            edited_df.to_excel(writer, index=False, sheet_name='Leads')
+        
+        processed_data = output.getvalue()
+        
+        st.download_button(
+            label="📥 Excel Olarak İndir (.xlsx)",
+            data=processed_data,
+            file_name=f"leads_{target_industry}_{target_location}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+        
+        # 5. ADIM: AI ANALİZ (Opsiyonel Eklenti)
+        if openai_api_key and not df.empty:
+            st.divider()
+            if st.button("🧠 AI Analizi Yap (İlk 3 Kişi)"):
+                client = OpenAI(api_key=openai_api_key)
+                st.write("GPT-4 profilleri analiz ediyor...")
                 
-                MÜŞTERİ:
-                İsim: {lead['name']}
-                Bağlam: {lead['snippet']}
-                
-                BİZİM ÜRÜN:
-                Ürün: {product_name}
-                Değer: {value_proposition}
-                
-                GÖREV:
-                Bu müşteriye özel, samimi ve kısa bir soğuk satış maili yaz. 
-                Asla "Umarım bu mail sizi iyi bulur" gibi klişeler kullanma.
-                Doğrudan konuya gir ve bağlamı kullanarak ilgisini çek.
-                Sadece mail içeriğini döndür.
-                """
-                
-                response = client.chat.completions.create(
-                    model="gpt-4o",
-                    messages=[{"role": "user", "content": prompt}]
-                )
-                
-                email_content = response.choices[0].message.content
-                st.text_area("Mail İçeriği", email_content, height=200)
-                
-                if st.button(f"Gönder ({lead['name']})", key=lead['link']):
-                    # Burada gerçek mail atma fonksiyonu çağrılır
-                    res = send_email_mock(lead['name'], email_content)
-                    st.toast(f"Mail gönderildi: {lead['name']}", icon="✅")
+                for index, row in df.head(3).iterrows():
+                    with st.expander(f"Analiz: {row['Ad Soyad']} - {row['Şirket']}"):
+                        prompt = f"Şu kişiye satış yapmak istiyorum: {row['Ad Soyad']}, {row['Ünvan']}, {row['Şirket']}. Hakkındaki kısa bilgi: {row['Bağlam (Snippet)']}. Bana bu kişiye atılacak 'hook' (kanca) cümlesini yaz."
+                        res = client.chat.completions.create(model="gpt-4o", messages=[{"role":"user", "content": prompt}])
+                        st.write(res.choices[0].message.content)
 
-# --- UI TETİKLEYİCİSİ ---
-if st.button("Ajanı Çalıştır", type="primary"):
-    run_agent()
+if __name__ == "__main__":
+    run_app()
