@@ -3,13 +3,15 @@ import pandas as pd
 import requests
 import json
 import io
+import re
+from urllib.parse import urlparse
 from openai import OpenAI
 
 # --- SAYFA AYARLARI ---
-st.set_page_config(page_title="AI Sales Hunter (Smart Edition)", page_icon="🧠", layout="wide")
+st.set_page_config(page_title="AI Sales Hunter (Domain Edition)", page_icon="🌐", layout="wide")
 
-st.title("🧠 B2B Sales Agent: AI Destekli Ayrıştırma")
-st.markdown("Google sonuçlarını AI ile analiz eder, şirketi doğru tespit eder ve Apollo ile zenginleştirir.")
+st.title("🌐 B2B Sales Agent: Domain Discovery Modu")
+st.markdown("1. Google'dan Kişiyi Bul -> 2. GPT ile Şirketi Ayıkla -> 3. Domaini Bul -> 4. Apollo ile Nokta Atışı Yap")
 
 # --- SIDEBAR: AYARLAR ---
 with st.sidebar:
@@ -31,8 +33,8 @@ with st.sidebar:
 
 # --- YARDIMCI FONKSİYONLAR ---
 
-def google_search(position, industry, location, api_key, num_results):
-    """Google Serper API ile arama yapar."""
+def google_search_linkedin(position, industry, location, api_key, num_results):
+    """Kişileri bulmak için LinkedIn araması."""
     url = "https://google.serper.dev/search"
     query = f'site:linkedin.com/in/ "{position}" "{industry}" "{location}"'
     
@@ -45,46 +47,71 @@ def google_search(position, industry, location, api_key, num_results):
     except Exception as e:
         return {"error": str(e)}
 
+def find_company_domain(company_name, api_key):
+    """
+    Şirket isminden Web Sitesini (Domain) bulur.
+    Örnek: "Nestle" -> "nestle.com"
+    """
+    if company_name == "Bilinmiyor":
+        return None
+
+    url = "https://google.serper.dev/search"
+    # Google'a "Nestle official website" diye soruyoruz
+    query = f'{company_name} official website'
+    
+    payload = json.dumps({"q": query, "num": 1})
+    headers = {'X-API-KEY': api_key, 'Content-Type': 'application/json'}
+
+    try:
+        response = requests.post(url, headers=headers, data=payload)
+        results = response.json()
+        
+        if "organic" in results and len(results["organic"]) > 0:
+            link = results["organic"][0]["link"]
+            # Linkten domaini temizle (https://www.nestle.com/jobs -> nestle.com)
+            parsed_uri = urlparse(link)
+            domain = parsed_uri.netloc.replace("www.", "")
+            return domain
+        return None
+    except:
+        return None
+
 def extract_info_with_gpt(raw_title, snippet, client):
-    """
-    Basit string parçalama yerine GPT-4 kullanarak Ad, Ünvan ve Şirketi 'Zekice' ayıklar.
-    """
+    """GPT-4 ile metin analizi."""
     prompt = f"""
-    Aşağıdaki LinkedIn arama sonucundan Kişi Adı, Ünvanı ve Şirket İsmini JSON formatında çıkar.
+    Aşağıdaki veriden Kişi, Ünvan ve Şirket bilgisini çıkar.
     
     GİRDİ:
     Title: {raw_title}
     Snippet: {snippet}
     
     KURALLAR:
-    1. Eğer şirket ismi 'at' veya '@' kelimesinden sonraysa onu al. (Örn: Manager at Apple -> Şirket: Apple)
-    2. Şirket ismi yoksa snippet kısmına bak.
-    3. Hiçbir yerde yoksa "Bilinmiyor" yaz.
-    4. Sadece saf JSON döndür.
+    1. Şirket ismini 'at' veya '@' sonrasından almaya çalış.
+    2. JSON formatında döndür.
     
-    JSON FORMATI:
+    JSON:
     {{
         "name": "Ad Soyad",
         "role": "Ünvan",
         "company": "Şirket Adı"
     }}
     """
-    
     try:
         response = client.chat.completions.create(
-            model="gpt-4o-mini", # Hızlı ve ucuz model
+            model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
             response_format={"type": "json_object"}
         )
-        content = response.choices[0].message.content
-        return json.loads(content)
-    except Exception as e:
-        return {"name": "Hata", "role": "Hata", "company": "Hata"}
+        return json.loads(response.choices[0].message.content)
+    except:
+        return {"name": "Hata", "role": "Hata", "company": "Bilinmiyor"}
 
-def find_email_apollo(name, company, api_key):
-    """Apollo.io ile mail bulur."""
-    if not api_key or company == "Bilinmiyor":
-        return "Veri Yok", "❌ Eksik Bilgi"
+def find_email_apollo_with_domain(name, domain, api_key):
+    """
+    Apollo'da Domain + İsim ile arama yapar. EN GÜÇLÜ YÖNTEMDİR.
+    """
+    if not api_key or not domain:
+        return "Domain Yok", "❌ Domain Bulunamadı"
 
     url = "https://api.apollo.io/v1/people/match"
     
@@ -96,7 +123,7 @@ def find_email_apollo(name, company, api_key):
         "api_key": api_key,
         "first_name": first_name,
         "last_name": last_name,
-        "organization_name": company
+        "organization_domain": domain # <-- ARTIK İSİM DEĞİL DOMAIN ATIYORUZ
     }
     
     headers = {'Content-Type': 'application/json', 'Cache-Control': 'no-cache'}
@@ -108,87 +135,89 @@ def find_email_apollo(name, company, api_key):
         if "person" in data and data["person"]:
             email = data["person"].get("email")
             if email:
-                return email, "✅ Eşleşti"
+                return email, "✅ Eşleşti (Domain)"
             else:
                 return "Mail Gizli", "⚠️ Profil Var, Mail Yok"
         else:
-            return "Bulunamadı", "❌ Eşleşme Yok"
+            # Domain eşleşmediyse son çare şirket adıyla dene (Opsiyonel)
+            return "Bulunamadı", "❌ Apollo'da Yok"
             
     except Exception as e:
-        return "Hata", f"API Hatası"
+        return "Hata", "API Hatası"
 
 # --- ANA UYGULAMA ---
 
 def run_app():
     if not serper_api_key or not apollo_api_key or not openai_api_key:
-        st.warning("⚠️ Lütfen sol menüden TÜM API anahtarlarını girin (OpenAI dahil).")
+        st.warning("⚠️ Lütfen tüm API anahtarlarını girin.")
         return
 
-    if st.button("🚀 Akıllı Taramayı Başlat", type="primary"):
+    if st.button("🚀 Domain Destekli Taramayı Başlat", type="primary"):
         
         client = OpenAI(api_key=openai_api_key)
         status_box = st.status("İşlem Başlatılıyor...", expanded=True)
         
         # 1. ADIM: GOOGLE ARAMASI
-        status_box.write("🔍 Google taranıyor...")
-        results = google_search(target_position, target_industry, target_location, serper_api_key, search_limit)
+        status_box.write("🔍 Google'da kişiler aranıyor...")
+        results = google_search_linkedin(target_position, target_industry, target_location, serper_api_key, search_limit)
         
         if "organic" not in results:
-            status_box.update(label="Hata oluştu!", state="error")
-            st.error("Google'dan sonuç dönmedi.")
+            status_box.update(label="Hata!", state="error")
+            st.error("Sonuç yok.")
             return
 
         items = results["organic"]
         processed_data = []
         
-        # 2. ADIM: AI PARSING ve APOLLO
-        status_box.write(f"🧠 {len(items)} profil GPT-4 ile analiz ediliyor...")
-        progress_bar = status_box.progress(0)
         total_items = len(items)
+        progress_bar = status_box.progress(0)
         
         for i, item in enumerate(items):
-            raw_title = item.get("title", "")
-            snippet = item.get("snippet", "")
-            linkedin_url = item.get("link")
-            
-            # --- YENİLİK: AI İLE AYRIŞTIRMA ---
-            parsed_info = extract_info_with_gpt(raw_title, snippet, client)
+            # A. Parsing
+            status_box.write(f"🧠 Analiz ediliyor: {i+1}/{total_items}")
+            parsed_info = extract_info_with_gpt(item.get("title", ""), item.get("snippet", ""), client)
             
             name = parsed_info.get("name", "Bilinmiyor")
             role = parsed_info.get("role", "Bilinmiyor")
             company = parsed_info.get("company", "Bilinmiyor")
             
-            # Apollo API Çağrısı
-            email, status = find_email_apollo(name, company, apollo_api_key)
+            # B. Domain Bulma (YENİ ADIM)
+            domain = None
+            if company != "Bilinmiyor":
+                domain = find_company_domain(company, serper_api_key)
+            
+            # C. Apollo Arama (Domain ile)
+            email, status = find_email_apollo_with_domain(name, domain, apollo_api_key)
             
             processed_data.append({
                 "Ad Soyad": name,
                 "Ünvan": role,
                 "Şirket": company,
+                "Website (Domain)": domain, # Yeni Sütun
                 "E-Posta": email,
                 "Durum": status,
-                "LinkedIn URL": linkedin_url
+                "LinkedIn URL": item.get("link")
             })
             
             progress_bar.progress((i + 1) / total_items)
             
-        status_box.update(label="✅ İşlem Tamamlandı!", state="complete", expanded=False)
+        status_box.update(label="✅ Tamamlandı!", state="complete", expanded=False)
         
-        # 3. ADIM: TABLO
+        # TABLO
         df = pd.DataFrame(processed_data)
+        st.subheader(f"📋 Sonuçlar ({len(df)})")
         
-        st.subheader(f"📋 Sonuçlar ({len(df)} Kayıt)")
         edited_df = st.data_editor(
             df,
             column_config={
                 "LinkedIn URL": st.column_config.LinkColumn("Profil"),
-                "E-Posta": st.column_config.TextColumn("E-Posta", validate="^[\w\.-]+@[\w\.-]+\.\w+$"),
+                "Website (Domain)": st.column_config.LinkColumn("Web Sitesi"),
             },
             hide_index=True,
             use_container_width=True
         )
         
-        # 4. ADIM: EXCEL
+        # EXCEL
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
             edited_df.to_excel(writer, index=False, sheet_name='Leads')
@@ -196,7 +225,7 @@ def run_app():
         st.download_button(
             label="📥 Excel İndir",
             data=output.getvalue(),
-            file_name=f"SmartLeads_{target_industry}.xlsx",
+            file_name="Leads_with_Domains.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             type="primary"
         )
