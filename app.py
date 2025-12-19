@@ -35,7 +35,7 @@ with st.sidebar:
     target_position = st.text_input("Ünvan", "Quality Assurance Manager")
     target_industry = st.text_input("Sektör", "Pharma")
     target_location = st.text_input("Lokasyon", "Dubai")
-    search_limit = st.slider("Sonuç Sayısı", 5, 20, 10)
+    search_limit = st.slider("Sonuç Sayısı", 5, 20, 100)
 
     st.divider()
 
