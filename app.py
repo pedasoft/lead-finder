@@ -1,324 +1,256 @@
 import streamlit as st
 import pandas as pd
 import requests
-import json
 import io
-from urllib.parse import urlparse
-from openai import OpenAI
+from typing import Any, Dict, List, Tuple
 
 # -----------------------------
 # PAGE
 # -----------------------------
 st.set_page_config(
-    page_title="AI Sales Hunter (Domain + Apollo Match)",
-    page_icon="🌐",
+    page_title="Apollo Lead Finder (Search + Enrich)",
+    page_icon="🛰️",
     layout="wide"
 )
 
-st.title("🌐 B2B Sales Agent: Domain Discovery + Apollo Match")
-st.markdown("1) Google/Serper ile LinkedIn bul → 2) GPT ile kişi/şirket ayıkla → 3) Domain bul → 4) Apollo Match ile email enrich")
+st.title("🛰️ Apollo Lead Finder (Tek Key)")
+st.markdown("Apollo People Search → Bulk Enrich: Title + Location + Industry filtrele, isim/şirket/email getir.")
 
 # -----------------------------
 # SIDEBAR
 # -----------------------------
 with st.sidebar:
-    st.header("⚙️ Konfigürasyon")
+    st.header("⚙️ Ayarlar")
 
-    st.subheader("1) API Keys")
-    openai_api_key = st.text_input("OpenAI API Key", type="password")
-    serper_api_key = st.text_input("Serper (Google) API Key", type="password")
-    apollo_api_key = st.text_input("Apollo.io API Key", type="password")
+    apollo_api_key = st.text_input("Apollo API Key (Master önerilir)", type="password")
 
     st.divider()
+    st.subheader("🎯 Filtreler")
+    target_title = st.text_input("Title (job title)", "Quality Assurance Manager")
+    target_location = st.text_input("Location (person location)", "Dubai")
+    target_industry = st.text_input("Industry (organization industry)", "Pharma")
 
-    st.subheader("2) Hedef Kitle")
-    target_position = st.text_input("Ünvan", "Quality Assurance Manager")
-    target_industry = st.text_input("Sektör", "Pharma")
-    target_location = st.text_input("Lokasyon", "Dubai")
-    search_limit = st.slider("Sonuç Sayısı", 5, 20, 100)
+    per_page = st.slider("Sayfada kaç kişi (1-100)", 1, 100, 25)
+    max_results = st.slider("Toplam sonuç limiti", 10, 300, 100, step=10)
 
     st.divider()
-
-    st.subheader("3) Apollo Reveal Ayarları")
+    st.subheader("🔎 Enrichment (email)")
     reveal_personal_emails = st.toggle("Kişisel emailleri reveal etmeyi dene", value=False)
     reveal_phone_number = st.toggle("Telefon reveal etmeyi dene", value=False)
 
 # -----------------------------
+# CONSTANTS
+# -----------------------------
+APOLLO_PEOPLE_SEARCH_URL = "https://api.apollo.io/api/v1/mixed_people/api_search"
+APOLLO_BULK_MATCH_URL = "https://api.apollo.io/api/v1/people/bulk_match"
+
+# -----------------------------
 # HELPERS
 # -----------------------------
-SERPER_URL = "https://google.serper.dev/search"
-APOLLO_MATCH_URL = "https://api.apollo.io/api/v1/people/match"
+def apollo_headers(api_key: str) -> Dict[str, str]:
+    return {
+        "Content-Type": "application/json",
+        "accept": "application/json",
+        "Cache-Control": "no-cache",
+        "X-Api-Key": api_key
+    }
 
-
-def safe_post(url: str, headers: dict, payload: dict | None = None, params: dict | None = None, timeout: int = 30):
-    """requests.post wrapper with basic error handling."""
-    r = requests.post(url, headers=headers, json=payload, params=params, timeout=timeout)
-    # Apollo bazen non-200 döner, burada body'yi yakalamak faydalı
+def safe_post(url: str, headers: Dict[str, str], params: Dict[str, Any] | None = None, payload: Dict[str, Any] | None = None, timeout: int = 30) -> Tuple[int, Dict[str, Any]]:
+    r = requests.post(url, headers=headers, params=params, json=payload, timeout=timeout)
     try:
         data = r.json()
     except Exception:
         data = {"raw": r.text}
     return r.status_code, data
 
+def chunked(lst: List[Any], n: int) -> List[List[Any]]:
+    return [lst[i:i+n] for i in range(0, len(lst), n)]
 
-def google_search_linkedin(position: str, industry: str, location: str, api_key: str, num_results: int):
-    """Serper üzerinden Google'da LinkedIn profilleri arar."""
-    query = f'site:linkedin.com/in/ "{position}" "{industry}" "{location}"'
-    headers = {"X-API-KEY": api_key, "Content-Type": "application/json"}
-    payload = {"q": query, "num": num_results}
-
-    try:
-        status, data = safe_post(SERPER_URL, headers=headers, payload=payload, timeout=30)
-        if status >= 400:
-            return {"error": f"Serper HTTP {status}", "details": data}
-        return data
-    except Exception as e:
-        return {"error": str(e)}
-
-
-def clean_domain_from_url(link: str) -> str | None:
-    """https://www.nestle.com/jobs -> nestle.com"""
-    if not link:
-        return None
-    try:
-        parsed = urlparse(link)
-        if not parsed.netloc:
-            return None
-        return parsed.netloc.replace("www.", "")
-    except Exception:
-        return None
-
-
-def find_company_domain(company_name: str, serper_key: str) -> str | None:
-    """Şirket isminden domain bulur (serper)."""
-    if not company_name or company_name == "Bilinmiyor":
-        return None
-
-    query = f'{company_name} official website'
-    headers = {"X-API-KEY": serper_key, "Content-Type": "application/json"}
-    payload = {"q": query, "num": 3}
-
-    try:
-        status, data = safe_post(SERPER_URL, headers=headers, payload=payload, timeout=30)
-        if status >= 400:
-            return None
-        organic = data.get("organic", [])
-        if not organic:
-            return None
-
-        # İlk sonucu al ama istersen birkaçını kontrol edip en iyi domaini seçebilirsin
-        link = organic[0].get("link", "")
-        return clean_domain_from_url(link)
-    except Exception:
-        return None
-
-
-def extract_info_with_gpt(raw_title: str, snippet: str, client: OpenAI) -> dict:
-    """Google sonucundan kişi / ünvan / şirket ayıklar."""
-    prompt = f"""
-Aşağıdaki veriden Kişi, Ünvan ve Şirket bilgisini çıkar.
-
-GİRDİ:
-Title: {raw_title}
-Snippet: {snippet}
-
-KURALLAR:
-- Sadece JSON döndür.
-- Şirketi mümkünse "at" / "@" / "-" gibi ayırıcılardan yakala.
-- Bulamazsan "Bilinmiyor" yaz.
-
-JSON:
-{{
-  "name": "Ad Soyad",
-  "role": "Ünvan",
-  "company": "Şirket Adı"
-}}
-"""
-    try:
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            response_format={"type": "json_object"}
-        )
-        return json.loads(resp.choices[0].message.content)
-    except Exception:
-        return {"name": "Bilinmiyor", "role": "Bilinmiyor", "company": "Bilinmiyor"}
-
-
-def apollo_people_match(api_key: str, linkedin_url: str | None, name: str | None, domain: str | None,
-                       reveal_personal: bool, reveal_phone: bool):
+def apollo_people_search(api_key: str, title: str, location: str, industry: str, per_page: int, page: int) -> Tuple[List[Dict[str, Any]], int]:
     """
-    Apollo match:
-    1) linkedin_url ile dene
-    2) name+domain ile dene
+    People API Search email dönmez; sadece kişi listesi verir. :contentReference[oaicite:3]{index=3}
     """
-    if not api_key:
-        return "API Key Yok", "❌ Apollo API Key yok"
+    headers = apollo_headers(api_key)
 
-    headers = {
-        "Content-Type": "application/json",
-        "accept": "application/json",
-        "X-Api-Key": api_key
+    # Query params formatı: person_titles[]=..., person_locations[]=... :contentReference[oaicite:4]{index=4}
+    params = {
+        "per_page": per_page,
+        "page": page,
+        "person_titles[]": [title] if title else [],
+        "person_locations[]": [location] if location else [],
     }
 
+    # Industry filtresi Apollo’da query param olarak kullanılabiliyor (org industry). Bazı hesaplarda isim farklı olabilir;
+    # çalışmazsa yine de search sonuç döner, sadece industry filtresi uygulanmayabilir.
+    if industry:
+        params["organization_industries[]"] = [industry]
+
+    status, data = safe_post(APOLLO_PEOPLE_SEARCH_URL, headers=headers, params=params, payload=None, timeout=45)
+
+    if status >= 400:
+        msg = data.get("message") or data.get("error") or f"HTTP {status}"
+        raise RuntimeError(f"Apollo People Search hata: {msg} | Detay: {data}")
+
+    people = data.get("people", []) or []
+    total_entries = int(data.get("total_entries", 0) or 0)
+    return people, total_entries
+
+def apollo_bulk_enrich(api_key: str, person_ids: List[str], reveal_personal: bool, reveal_phone: bool) -> List[Dict[str, Any]]:
+    """
+    Bulk People Enrichment: details[] içinde id ile enrich. :contentReference[oaicite:5]{index=5}
+    """
+    headers = apollo_headers(api_key)
     params = {
         "reveal_personal_emails": str(reveal_personal).lower(),
-        "reveal_phone_number": str(reveal_phone).lower()
+        "reveal_phone_number": str(reveal_phone).lower(),
     }
+    payload = {"details": [{"id": pid} for pid in person_ids]}
 
-    # 1) LinkedIn match
-    if linkedin_url:
-        payload = {"linkedin_url": linkedin_url}
-        try:
-            status, data = safe_post(APOLLO_MATCH_URL, headers=headers, payload=payload, params=params, timeout=30)
-            if status < 400:
-                person = data.get("person")
-                if person:
-                    email = person.get("email")
-                    if email:
-                        return email, "✅ Eşleşti (LinkedIn)"
-                    return "Mail Yok", "⚠️ Profil Var, Mail Yok"
-            else:
-                # Apollo hata döndürürse görmek için aşağıda status'a yazarız
-                pass
-        except Exception:
-            pass
+    status, data = safe_post(APOLLO_BULK_MATCH_URL, headers=headers, params=params, payload=payload, timeout=45)
 
-    # 2) Name + domain match
-    if not (name and domain):
-        if not domain:
-            return "Domain Yok", "❌ Domain bulunamadı"
-        return "İsim Yok", "❌ İsim parse edilemedi"
+    if status >= 400:
+        msg = data.get("message") or data.get("error") or f"HTTP {status}"
+        raise RuntimeError(f"Apollo Bulk Enrich hata: {msg} | Detay: {data}")
 
-    parts = name.split()
-    first_name = parts[0] if parts else ""
-    last_name = " ".join(parts[1:]) if len(parts) > 1 else ""
+    # Dönüş formatı hesaplara göre değişebiliyor; genelde "people" listesi veya "contacts"/"persons" benzeri gelir.
+    # En güvenlisi: olası alanları dene.
+    enriched = (
+        data.get("people")
+        or data.get("persons")
+        or data.get("contacts")
+        or data.get("matches")
+        or []
+    )
 
-    payload = {
-        "first_name": first_name,
-        "last_name": last_name,
-        "domain": domain  # <-- doğru alan
+    # Bazı durumlarda wrapper olur:
+    if isinstance(enriched, dict):
+        enriched = enriched.get("people") or enriched.get("persons") or []
+
+    return enriched if isinstance(enriched, list) else []
+
+def pick_name_company_email(search_person: Dict[str, Any], enriched_map: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    pid = search_person.get("id", "")
+    org = search_person.get("organization") or {}
+    company = org.get("name", "") if isinstance(org, dict) else ""
+
+    # Search response bazen last_name obfuscated döner. :contentReference[oaicite:6]{index=6}
+    first = search_person.get("first_name", "") or ""
+    last = search_person.get("last_name", "") or search_person.get("last_name_obfuscated", "") or ""
+
+    email = ""
+    status = "—"
+
+    if pid and pid in enriched_map:
+        ep = enriched_map[pid]
+        # Enrichment genelde tam isim ve email içerir
+        first = ep.get("first_name", first) or first
+        last = ep.get("last_name", last) or last
+        company = (ep.get("organization", {}) or {}).get("name", company) if isinstance(ep.get("organization"), dict) else company
+        email = ep.get("email") or ""
+        status = "✅ Enriched" if email else "⚠️ Enriched, email yok"
+
+    full_name = (first + " " + last).strip()
+    return {
+        "Ad Soyad": full_name,
+        "Şirket": company,
+        "E-Posta": email if email else "Bulunamadı",
+        "Apollo Person ID": pid,
+        "Durum": status
     }
-
-    try:
-        status, data = safe_post(APOLLO_MATCH_URL, headers=headers, payload=payload, params=params, timeout=30)
-        if status >= 400:
-            return "Hata", f"API Hatası (HTTP {status})"
-        person = data.get("person")
-        if person:
-            email = person.get("email")
-            if email:
-                return email, "✅ Eşleşti (Name+Domain)"
-            return "Mail Yok", "⚠️ Profil Var, Mail Yok"
-        return "Bulunamadı", "❌ Eşleşme Yok"
-    except Exception as e:
-        return "Hata", f"API Hatası: {str(e)}"
-
 
 # -----------------------------
 # APP
 # -----------------------------
 def run_app():
-    if not (openai_api_key and serper_api_key and apollo_api_key):
-        st.warning("⚠️ OpenAI + Serper + Apollo API key'lerini gir.")
+    if not apollo_api_key:
+        st.warning("⚠️ Apollo API key gir.")
         return
 
-    if st.button("🚀 Taramayı Başlat", type="primary"):
-        client = OpenAI(api_key=openai_api_key)
-        status_box = st.status("İşlem başlıyor...", expanded=True)
+    if st.button("🚀 Lead Bul (Apollo)", type="primary"):
+        status_box = st.status("Başlıyor...", expanded=True)
 
-        # 1) Google/Serper search
-        status_box.write("🔍 Google/Serper ile LinkedIn profilleri aranıyor...")
-        results = google_search_linkedin(
-            target_position,
-            target_industry,
-            target_location,
-            serper_api_key,
-            search_limit
-        )
+        try:
+            # 1) People Search (sayfalama)
+            collected_people: List[Dict[str, Any]] = []
+            page = 1
+            total_entries = 0
 
-        if "error" in results:
-            status_box.update(label="Hata!", state="error")
-            st.error(results["error"])
-            if "details" in results:
-                st.json(results["details"])
-            return
+            while len(collected_people) < max_results:
+                status_box.write(f"🔎 People Search: page={page} ...")
+                people, total_entries = apollo_people_search(
+                    apollo_api_key,
+                    target_title.strip(),
+                    target_location.strip(),
+                    target_industry.strip(),
+                    per_page,
+                    page
+                )
+                if not people:
+                    break
 
-        organic = results.get("organic", [])
-        if not organic:
-            status_box.update(label="Hata!", state="error")
-            st.error("Google sonuçları boş döndü.")
-            return
+                collected_people.extend(people)
+                if len(people) < per_page:
+                    break
+                page += 1
 
-        processed = []
-        total = len(organic)
-        progress = status_box.progress(0)
+            collected_people = collected_people[:max_results]
+            if not collected_people:
+                status_box.update(label="Sonuç yok", state="error")
+                st.error("Filtrelerle kişi bulunamadı. Title/Location/Industry değiştir.")
+                return
 
-        for i, item in enumerate(organic, start=1):
-            title = item.get("title", "")
-            snippet = item.get("snippet", "")
-            linkedin_url = item.get("link")
+            status_box.write(f"✅ Bulunan kişi sayısı: {len(collected_people)} (toplam entries: {total_entries})")
 
-            status_box.write(f"🧠 Analiz: {i}/{total}")
+            # 2) Bulk Enrich (10’lu batch)
+            ids = [p.get("id") for p in collected_people if p.get("id")]
+            ids = [x for x in ids if isinstance(x, str) and x.strip()]
 
-            # 2) GPT parse
-            parsed = extract_info_with_gpt(title, snippet, client)
-            name = parsed.get("name", "Bilinmiyor")
-            role = parsed.get("role", "Bilinmiyor")
-            company = parsed.get("company", "Bilinmiyor")
+            enriched_map: Dict[str, Dict[str, Any]] = {}
+            batches = chunked(ids, 10)
 
-            # 3) Domain
-            domain = find_company_domain(company, serper_api_key) if company != "Bilinmiyor" else None
+            for i, batch in enumerate(batches, start=1):
+                status_box.write(f"🧬 Bulk Enrich: {i}/{len(batches)} (batch size={len(batch)})")
+                enriched_list = apollo_bulk_enrich(
+                    apollo_api_key,
+                    batch,
+                    reveal_personal_emails,
+                    reveal_phone_number
+                )
 
-            # 4) Apollo match
-            email, apollo_status = apollo_people_match(
-                api_key=apollo_api_key,
-                linkedin_url=linkedin_url,
-                name=name if name != "Bilinmiyor" else None,
-                domain=domain,
-                reveal_personal=reveal_personal_emails,
-                reveal_phone=reveal_phone_number
+                # Enriched kayıtları id ile map’le
+                for ep in enriched_list:
+                    if isinstance(ep, dict):
+                        eid = ep.get("id") or ep.get("person_id")
+                        if eid:
+                            enriched_map[str(eid)] = ep
+
+            # 3) Birleştir
+            rows = [pick_name_company_email(p, enriched_map) for p in collected_people]
+            df = pd.DataFrame(rows)
+
+            status_box.update(label="✅ Tamamlandı!", state="complete", expanded=False)
+
+            st.subheader(f"📋 Sonuçlar ({len(df)} kayıt)")
+            edited_df = st.data_editor(df, hide_index=True, use_container_width=True)
+
+            # Excel
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine="openpyxl") as writer:
+                edited_df.to_excel(writer, index=False, sheet_name="Leads")
+
+            st.download_button(
+                label="📥 Excel İndir",
+                data=output.getvalue(),
+                file_name="apollo_leads.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="primary"
             )
 
-            processed.append({
-                "Ad Soyad": name,
-                "Ünvan": role,
-                "Şirket": company,
-                "Domain": domain or "",
-                "E-Posta": email,
-                "Durum": apollo_status,
-                "LinkedIn URL": linkedin_url or ""
-            })
-
-            progress.progress(i / total)
-
-        status_box.update(label="✅ Tamamlandı!", state="complete", expanded=False)
-
-        df = pd.DataFrame(processed)
-        st.subheader(f"📋 Sonuçlar ({len(df)} Kayıt)")
-
-        edited_df = st.data_editor(
-            df,
-            column_config={
-                "LinkedIn URL": st.column_config.LinkColumn("Profil"),
-            },
-            hide_index=True,
-            use_container_width=True
-        )
-
-        # Excel Export
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine="openpyxl") as writer:
-            edited_df.to_excel(writer, index=False, sheet_name="Leads")
-
-        st.download_button(
-            label="📥 Excel İndir",
-            data=output.getvalue(),
-            file_name="Leads_Apollo_Match.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            type="primary"
-        )
-
+        except Exception as e:
+            status_box.update(label="Hata!", state="error")
+            st.error(str(e))
+            st.info("Not: mixed_people/api_search endpoint'i master API key gerektirebilir. Key izinlerini kontrol et.")
+            return
 
 if __name__ == "__main__":
     run_app()
